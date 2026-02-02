@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Project Researcher - wrapper script
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_PYTHON="$SCRIPT_DIR/venv/bin/python"
+
+if [[ ! -f "$VENV_PYTHON" ]]; then
+    echo "Setting up virtual environment..."
+    python3 -m venv "$SCRIPT_DIR/venv"
+    "$VENV_PYTHON" -m pip install -q -r "$SCRIPT_DIR/requirements.txt"
+fi
+
+exec "$VENV_PYTHON" "$SCRIPT_DIR/agent.py" "$@"
