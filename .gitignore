@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Claude Code
+.claude/
+
+# User-specific research output
+research/topics/
