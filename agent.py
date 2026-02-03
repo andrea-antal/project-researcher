@@ -4,15 +4,18 @@ Project Researcher Agent
 
 An interactive research agent that:
 1. Takes a research topic
-2. Asks clarifying questions to understand scope
-3. Searches the web for relevant sources
-4. Extracts and synthesizes information
-5. Builds a local knowledge base
-6. Answers follow-up questions using accumulated context
+2. Auto-detects the appropriate domain (tech, policy, thought-leadership, general)
+3. Asks clarifying questions to understand scope
+4. Searches the web for relevant sources
+5. Extracts and synthesizes information
+6. Builds a local knowledge base
+7. Answers follow-up questions using accumulated context
+8. Synthesizes insights across all research topics
 """
 
 import re
 import sys
+import time
 from pathlib import Path
 
 import anyio
@@ -25,13 +28,90 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from config import PROMPTS_DIR, TOPICS_DIR
+from config import PROMPTS_DIR, TOPICS_DIR, SYNTHESIS_DIR, DOMAINS_DIR, DOMAINS
 
 
-def load_system_prompt() -> str:
-    """Load the researcher system prompt."""
-    prompt_file = PROMPTS_DIR / "researcher.md"
-    return prompt_file.read_text()
+class ToolProgressTracker:
+    """Track tool execution progress with timestamps and timeout warnings."""
+
+    SLOW_THRESHOLD = 30  # seconds before showing "still working..."
+
+    def __init__(self):
+        self.current_tool: str | None = None
+        self.current_detail: str = ""
+        self.start_time: float | None = None
+        self._warning_task: anyio.abc.TaskGroup | None = None
+        self._cancel_scope: anyio.CancelScope | None = None
+
+    def _timestamp(self) -> str:
+        """Get current timestamp string."""
+        return time.strftime("%H:%M:%S")
+
+    def _format_duration(self, seconds: float) -> str:
+        """Format duration in human-readable form."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        else:
+            mins = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{mins}m {secs}s"
+
+    def start(self, tool_name: str, detail: str = "") -> None:
+        """Record that a tool has started."""
+        # Complete previous tool if any
+        self.complete()
+
+        self.current_tool = tool_name
+        self.current_detail = detail
+        self.start_time = time.time()
+
+        detail_str = f": {detail}" if detail else ""
+        print(f"[{self._timestamp()}] {tool_name}{detail_str}...")
+
+    def complete(self) -> None:
+        """Mark current tool as complete."""
+        if self.current_tool and self.start_time:
+            duration = time.time() - self.start_time
+            duration_str = self._format_duration(duration)
+            print(f"[{self._timestamp()}] {self.current_tool} complete ({duration_str})")
+
+        self.current_tool = None
+        self.current_detail = ""
+        self.start_time = None
+
+    def check_slow(self) -> None:
+        """Check if current operation is slow and print warning."""
+        if self.current_tool and self.start_time:
+            elapsed = time.time() - self.start_time
+            if elapsed > self.SLOW_THRESHOLD:
+                print(f"[{self._timestamp()}] Still working on {self.current_tool}... ({self._format_duration(elapsed)} elapsed)")
+
+
+# Global tracker instance
+_tracker = ToolProgressTracker()
+
+
+def load_prompt(filename: str) -> str:
+    """Load a prompt file."""
+    prompt_file = PROMPTS_DIR / filename
+    if prompt_file.exists():
+        return prompt_file.read_text()
+    return ""
+
+
+def load_domain_prompt(domain: str) -> str:
+    """Load the domain-specific prompt."""
+    domain_file = DOMAINS_DIR / f"{domain}.md"
+    if domain_file.exists():
+        return domain_file.read_text()
+    return load_domain_prompt("general")
+
+
+def build_system_prompt(domain: str) -> str:
+    """Build the full system prompt from core + domain."""
+    core = load_prompt("core.md")
+    domain_prompt = load_domain_prompt(domain)
+    return f"{core}\n\n---\n\n{domain_prompt}"
 
 
 def slugify(text: str) -> str:
@@ -51,23 +131,57 @@ def get_topic_dir(topic: str) -> Path:
     return topic_dir
 
 
-async def research(topic: str) -> None:
+async def detect_domain(topic: str) -> str:
+    """Use Claude to detect the appropriate domain for a topic."""
+    detection_prompt = f"""Classify this research topic into exactly one domain.
+
+Topic: {topic}
+
+Domains:
+- tech: Software, programming, tools, frameworks, technical systems, developer topics
+- policy: Political theory, economics, governance, regulations, public policy, social policy
+- thought-leadership: Finding and vetting leading thinkers, experts, influential voices on any topic
+- general: Everything else that doesn't fit the above
+
+Respond with ONLY the domain name (tech, policy, thought-leadership, or general), nothing else."""
+
+    options = ClaudeAgentOptions(
+        system_prompt="You are a classifier. Respond only with the requested classification.",
+        allowed_tools=[],
+        max_turns=1,
+        permission_mode="acceptEdits",
+    )
+
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(detection_prompt)
+        async for message in client.receive_messages():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        domain = block.text.strip().lower()
+                        if domain in DOMAINS:
+                            return domain
+            elif isinstance(message, ResultMessage):
+                break
+
+    return "general"
+
+
+async def research(topic: str, domain: str | None = None) -> None:
     """Run the research agent on a topic."""
     topic_dir = get_topic_dir(topic)
-    system_prompt = load_system_prompt()
 
-    # Build the initial prompt with context about where to save
-    initial_prompt = f"""Research topic: {topic}
+    # Auto-detect domain if not specified
+    if domain is None:
+        print("[Detecting domain...]")
+        domain = await detect_domain(topic)
+        print(f"[Domain: {domain}]")
 
-Save your findings to: {topic_dir}
-- overview.md: Main summary and recommendations
-- sources.md: List of sources with key excerpts
-- notes/: Detailed notes on subtopics
-
-Start by asking clarifying questions to understand what aspects matter most."""
+    system_prompt = build_system_prompt(domain)
 
     print(f"\n{'=' * 60}")
     print(f"Research Topic: {topic}")
+    print(f"Domain: {domain}")
     print(f"Output Directory: {topic_dir}")
     print(f"{'=' * 60}\n")
 
@@ -76,7 +190,6 @@ Start by asking clarifying questions to understand what aspects matter most."""
         allowed_tools=[
             "WebSearch",
             "WebFetch",
-            "AskUserQuestion",
             "Read",
             "Write",
             "Glob",
@@ -87,10 +200,63 @@ Start by asking clarifying questions to understand what aspects matter most."""
     )
 
     async with ClaudeSDKClient(options=options) as client:
-        await client.query(initial_prompt)
+        # Phase 1: Get clarifying questions
+        clarify_prompt = f"""Research topic: {topic}
+
+Before researching, ask 2-3 clarifying questions to understand:
+- What specific aspects matter most
+- Desired depth (quick overview vs comprehensive)
+- Any constraints or preferences
+
+Output your questions as a numbered list. Do not start researching yet."""
+
+        await client.query(clarify_prompt)
+
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        print(block.text, end="", flush=True)
+                print()
+
+        # Phase 2: Get user's answers
+        print("\n" + "-" * 40)
+        print("Answer the questions above (or press Enter to skip):")
+        print("-" * 40)
+        try:
+            user_answers = input("\nYour answers: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nResearch cancelled.")
+            return
+
+        # Phase 3: Do the research with user context
+        research_prompt = f"""Now research the topic: {topic}
+
+User's clarifications: {user_answers if user_answers else "No specific preferences - use your judgment."}
+
+Save your findings to: {topic_dir}
+- overview.md: Main summary and recommendations
+- sources.md: List of sources with key excerpts
+- notes/: Detailed notes on subtopics
+
+Proceed with the research."""
+
+        await client.query(research_prompt)
+
+        tracker = ToolProgressTracker()
+        last_check = time.time()
 
         async for message in client.receive_messages():
+            # Check for slow operations periodically
+            now = time.time()
+            if now - last_check > 10:
+                tracker.check_slow()
+                last_check = now
+
             if isinstance(message, AssistantMessage):
+                # Complete any pending tool before showing text
+                tracker.complete()
+
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         print(block.text, end="", flush=True)
@@ -98,18 +264,24 @@ Start by asking clarifying questions to understand what aspects matter most."""
                         tool_name = block.name
                         if tool_name == "WebSearch":
                             query = block.input.get("query", "")
-                            print(f"\n[Searching: {query}...]\n")
+                            tracker.start("Search", query)
                         elif tool_name == "WebFetch":
                             url = block.input.get("url", "")
-                            print(f"\n[Fetching: {url}...]\n")
+                            # Truncate long URLs
+                            display_url = url if len(url) < 60 else url[:57] + "..."
+                            tracker.start("Fetch", display_url)
                         elif tool_name == "Write":
                             path = block.input.get("file_path", "")
-                            print(f"\n[Saving: {path}...]\n")
-                        elif tool_name == "AskUserQuestion":
-                            print("\n")  # Extra line before questions
+                            filename = Path(path).name
+                            tracker.start("Save", filename)
+                        elif tool_name == "Read":
+                            path = block.input.get("file_path", "")
+                            filename = Path(path).name
+                            tracker.start("Read", filename)
                 print()  # Newline after assistant message
 
             elif isinstance(message, ResultMessage):
+                tracker.complete()
                 print(f"\n{'=' * 60}")
                 print("Research complete!")
                 print(f"Notes saved to: {topic_dir}")
@@ -122,12 +294,14 @@ Start by asking clarifying questions to understand what aspects matter most."""
 async def follow_up(topic: str) -> None:
     """Continue a research session with follow-up questions."""
     topic_dir = get_topic_dir(topic)
-    system_prompt = load_system_prompt()
 
     if not topic_dir.exists():
         print(f"No existing research found for topic: {topic}")
         print("Run initial research first.")
         return
+
+    # Try to detect domain from existing research or use general
+    system_prompt = build_system_prompt("general")
 
     print(f"\n{'=' * 60}")
     print(f"Follow-up Session: {topic}")
@@ -139,7 +313,6 @@ async def follow_up(topic: str) -> None:
         allowed_tools=[
             "WebSearch",
             "WebFetch",
-            "AskUserQuestion",
             "Read",
             "Write",
             "Glob",
@@ -184,8 +357,10 @@ Then wait for the user's follow-up question."""
 
             await client.query(question)
 
+            tracker = ToolProgressTracker()
             async for message in client.receive_response():
                 if isinstance(message, AssistantMessage):
+                    tracker.complete()
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             print(block.text, end="", flush=True)
@@ -193,11 +368,95 @@ Then wait for the user's follow-up question."""
                             tool_name = block.name
                             if tool_name == "WebSearch":
                                 query = block.input.get("query", "")
-                                print(f"\n[Searching: {query}...]\n")
+                                tracker.start("Search", query)
                             elif tool_name == "WebFetch":
                                 url = block.input.get("url", "")
-                                print(f"\n[Fetching: {url}...]\n")
+                                display_url = url if len(url) < 60 else url[:57] + "..."
+                                tracker.start("Fetch", display_url)
+                            elif tool_name == "Write":
+                                path = block.input.get("file_path", "")
+                                tracker.start("Save", Path(path).name)
                     print()
+            tracker.complete()
+
+
+async def synthesize() -> None:
+    """Synthesize insights across all research topics."""
+    # Check if there are topics to synthesize
+    topics = [d for d in TOPICS_DIR.iterdir() if d.is_dir()]
+    if not topics:
+        print("No research topics found. Run some research first.")
+        return
+
+    print(f"\n{'=' * 60}")
+    print("Cross-Domain Synthesis")
+    print(f"Analyzing {len(topics)} topic(s)")
+    print(f"Output Directory: {SYNTHESIS_DIR}")
+    print(f"{'=' * 60}\n")
+
+    system_prompt = load_prompt("synthesize.md")
+
+    initial_prompt = f"""Synthesize insights across all research in: {TOPICS_DIR}
+
+Topics to analyze:
+{chr(10).join(f'- {t.name}' for t in topics)}
+
+Save your synthesis to: {SYNTHESIS_DIR}
+- connections.md: Cross-domain connections
+- patterns.md: Recurring themes and principles
+- tensions.md: Conflicts and trade-offs
+- questions.md: Open questions raised
+
+Start by reading the overview.md from each topic to understand what has been researched."""
+
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        allowed_tools=[
+            "Read",
+            "Write",
+            "Glob",
+            "Grep",
+        ],
+        max_turns=50,
+        permission_mode="acceptEdits",
+    )
+
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(initial_prompt)
+
+        tracker = ToolProgressTracker()
+        last_check = time.time()
+
+        async for message in client.receive_messages():
+            now = time.time()
+            if now - last_check > 10:
+                tracker.check_slow()
+                last_check = now
+
+            if isinstance(message, AssistantMessage):
+                tracker.complete()
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        print(block.text, end="", flush=True)
+                    elif isinstance(block, ToolUseBlock):
+                        tool_name = block.name
+                        if tool_name == "Write":
+                            path = block.input.get("file_path", "")
+                            tracker.start("Save", Path(path).name)
+                        elif tool_name == "Read":
+                            path = block.input.get("file_path", "")
+                            tracker.start("Read", Path(path).name)
+                print()
+
+            elif isinstance(message, ResultMessage):
+                tracker.complete()
+                print(f"\n{'=' * 60}")
+                print("Synthesis complete!")
+                print(f"Results saved to: {SYNTHESIS_DIR}")
+                if message.total_cost_usd:
+                    print(f"Cost: ${message.total_cost_usd:.4f}")
+                print(f"{'=' * 60}\n")
+                break
 
 
 async def interactive_session() -> None:
@@ -208,11 +467,19 @@ async def interactive_session() -> None:
     print("\nCommands:")
     print("  research <topic>  - Start new research on a topic")
     print("  follow <topic>    - Continue with follow-up questions")
+    print("  synthesize        - Find connections across all topics")
     print("  quit              - Exit")
+    print("\nDomains (auto-detected):")
+    print("  tech              - Software, tools, technical topics")
+    print("  policy            - Political theory, economics, governance")
+    print("  thought-leadership - Finding experts and leading thinkers")
+    print("  general           - Everything else")
     print("\nExamples:")
     print("  research Compare MCP servers for Postgres access")
-    print("  research Best practices for React state management")
+    print("  research Universal basic income policy arguments")
+    print("  research Who are the leading thinkers on AI alignment")
     print("  follow mcp-servers")
+    print("  synthesize")
     print()
 
     while True:
@@ -242,6 +509,8 @@ async def interactive_session() -> None:
                 print("Usage: follow <topic>")
                 continue
             await follow_up(arg)
+        elif cmd == "synthesize":
+            await synthesize()
         else:
             # Treat as a research topic if no command prefix
             await research(command)
@@ -256,6 +525,8 @@ def main() -> None:
         if sys.argv[1] == "follow" and len(sys.argv) > 2:
             topic = " ".join(sys.argv[2:])
             anyio.run(follow_up, topic)
+        elif sys.argv[1] == "synthesize":
+            anyio.run(synthesize)
         else:
             # Topic provided as command line argument
             topic = " ".join(sys.argv[1:])

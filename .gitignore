@@ -8,4 +8,4 @@ venv/
 .claude/
 
 # User-specific research output
-research/topics/
+output/topics/

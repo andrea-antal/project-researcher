@@ -2,7 +2,14 @@
 # Project Researcher - wrapper script
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks to get the actual script location
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 VENV_PYTHON="$SCRIPT_DIR/venv/bin/python"
 
 if [[ ! -f "$VENV_PYTHON" ]]; then
