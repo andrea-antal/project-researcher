@@ -2,6 +2,37 @@
 
 An interactive research agent built with the Claude Agent SDK that helps explore topics, build knowledge bases, and answer follow-up questions.
 
+## Status: Skill Alternative Recommended
+
+The SDK-based agent works well for single-threaded research, but **parallelization made API costs prohibitive**. A single complex research session with parallel sub-agents could cost $0.50-2.00+.
+
+**Recommended alternative:** Use the Claude Code skill version in `skill/`, which runs within your Claude Code session using your Max plan credits instead of API credits.
+
+### Installing the Skill
+
+```bash
+# Copy to your Claude Code skills directory
+cp -r skill ~/.claude/skills/research
+
+# Restart Claude Code to load the skill
+```
+
+### Using the Skill
+
+```
+/research <topic>                    # Start new research
+/research --domain=tech <topic>      # Force specific domain
+/research --parallel <topic>         # Parallel sub-agents (free with Max plan)
+/research --follow-up <topic-slug>   # Continue existing research
+/research --synthesize               # Cross-topic synthesis
+```
+
+The skill has the same features as the agent: domain detection, source vetting, clarifying questions, and knowledge persistence.
+
+---
+
+## Original Agent (SDK-based)
+
 ## Features
 
 - **Domain auto-detection**: Automatically applies appropriate research methodology
