@@ -22,6 +22,7 @@ import anyio
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
+    AgentDefinition,
     AssistantMessage,
     ResultMessage,
     TextBlock,
@@ -29,6 +30,31 @@ from claude_agent_sdk import (
 )
 
 from config import PROMPTS_DIR, TOPICS_DIR, SYNTHESIS_DIR, DOMAINS_DIR, DOMAINS
+
+
+# Define sub-agent types for parallel research threads
+RESEARCH_AGENTS = {
+    "research-thread": AgentDefinition(
+        description="Research a specific angle or subtopic thoroughly",
+        prompt="""You are a focused research agent. Research your assigned angle thoroughly:
+1. Search for authoritative sources
+2. Fetch and extract key information
+3. Save findings to your assigned output file
+4. Be thorough but focused on your specific angle only""",
+        tools=["WebSearch", "WebFetch", "Read", "Write"],
+        model="sonnet",
+    ),
+    "source-validator": AgentDefinition(
+        description="Validate and vet sources for credibility",
+        prompt="""You validate sources for research quality:
+1. Check author credentials
+2. Verify publication date and currency
+3. Cross-reference claims
+4. Rate source reliability""",
+        tools=["WebSearch", "WebFetch", "Read"],
+        model="haiku",
+    ),
+}
 
 
 class ToolProgressTracker:
@@ -194,7 +220,10 @@ async def research(topic: str, domain: str | None = None) -> None:
             "Write",
             "Glob",
             "Grep",
+            "Task",
+            "TodoWrite",
         ],
+        agents=RESEARCH_AGENTS,
         max_turns=50,
         permission_mode="acceptEdits",
     )
@@ -317,7 +346,10 @@ async def follow_up(topic: str) -> None:
             "Write",
             "Glob",
             "Grep",
+            "Task",
+            "TodoWrite",
         ],
+        agents=RESEARCH_AGENTS,
         max_turns=30,
         permission_mode="acceptEdits",
     )
@@ -378,6 +410,114 @@ Then wait for the user's follow-up question."""
                                 tracker.start("Save", Path(path).name)
                     print()
             tracker.complete()
+
+
+async def research_parallel(topic: str, domain: str | None = None) -> None:
+    """Run parallel research with sub-agents."""
+    topic_dir = get_topic_dir(topic)
+
+    # Auto-detect domain if not specified
+    if domain is None:
+        print("[Detecting domain...]")
+        domain = await detect_domain(topic)
+        print(f"[Domain: {domain}]")
+
+    system_prompt = build_system_prompt(domain)
+
+    print(f"\n{'=' * 60}")
+    print(f"Research Topic: {topic}")
+    print(f"Mode: Parallel")
+    print(f"Domain: {domain}")
+    print(f"Output Directory: {topic_dir}")
+    print(f"{'=' * 60}\n")
+
+    options = ClaudeAgentOptions(
+        system_prompt=system_prompt,
+        allowed_tools=[
+            "WebSearch",
+            "WebFetch",
+            "Read",
+            "Write",
+            "Glob",
+            "Grep",
+            "Task",
+            "TodoWrite",
+        ],
+        agents=RESEARCH_AGENTS,
+        max_turns=100,  # More turns for coordination
+        permission_mode="acceptEdits",
+    )
+
+    async with ClaudeSDKClient(options=options) as client:
+        decompose_prompt = f"""Research topic: {topic}
+Output directory: {topic_dir}
+
+Use PARALLEL research strategy:
+
+1. Analyze topic and identify 2-4 independent research angles
+2. Use TodoWrite to create a progress checklist with all angles
+3. Use Task tool to spawn "research-thread" sub-agents for each angle IN PARALLEL
+   - Each Task call should specify: description, prompt with angle details, subagent_type="research-thread"
+   - Launch ALL Task calls in the same message for parallel execution
+   - Each sub-agent saves to: {topic_dir}/notes/{{angle-slug}}.md
+4. After sub-agents complete, read their outputs
+5. Synthesize into {topic_dir}/overview.md
+6. Update TodoWrite with all completed
+
+Start by analyzing the topic and identifying research angles."""
+
+        await client.query(decompose_prompt)
+
+        tracker = ToolProgressTracker()
+        last_check = time.time()
+
+        async for message in client.receive_messages():
+            # Check for slow operations periodically
+            now = time.time()
+            if now - last_check > 10:
+                tracker.check_slow()
+                last_check = now
+
+            if isinstance(message, AssistantMessage):
+                # Complete any pending tool before showing text
+                tracker.complete()
+
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        print(block.text, end="", flush=True)
+                    elif isinstance(block, ToolUseBlock):
+                        tool_name = block.name
+                        if tool_name == "WebSearch":
+                            query = block.input.get("query", "")
+                            tracker.start("Search", query)
+                        elif tool_name == "WebFetch":
+                            url = block.input.get("url", "")
+                            display_url = url if len(url) < 60 else url[:57] + "..."
+                            tracker.start("Fetch", display_url)
+                        elif tool_name == "Write":
+                            path = block.input.get("file_path", "")
+                            filename = Path(path).name
+                            tracker.start("Save", filename)
+                        elif tool_name == "Read":
+                            path = block.input.get("file_path", "")
+                            filename = Path(path).name
+                            tracker.start("Read", filename)
+                        elif tool_name == "Task":
+                            desc = block.input.get("description", "")
+                            tracker.start("Task", desc)
+                        elif tool_name == "TodoWrite":
+                            tracker.start("TodoWrite", "updating progress")
+                print()  # Newline after assistant message
+
+            elif isinstance(message, ResultMessage):
+                tracker.complete()
+                print(f"\n{'=' * 60}")
+                print("Parallel research complete!")
+                print(f"Notes saved to: {topic_dir}")
+                if message.total_cost_usd:
+                    print(f"Cost: ${message.total_cost_usd:.4f}")
+                print(f"{'=' * 60}\n")
+                break
 
 
 async def synthesize() -> None:
@@ -466,6 +606,7 @@ async def interactive_session() -> None:
     print("=" * 60)
     print("\nCommands:")
     print("  research <topic>  - Start new research on a topic")
+    print("  parallel <topic>  - Research with parallel sub-agents")
     print("  follow <topic>    - Continue with follow-up questions")
     print("  synthesize        - Find connections across all topics")
     print("  quit              - Exit")
@@ -476,6 +617,7 @@ async def interactive_session() -> None:
     print("  general           - Everything else")
     print("\nExamples:")
     print("  research Compare MCP servers for Postgres access")
+    print("  parallel Compare AI video detection approaches")
     print("  research Universal basic income policy arguments")
     print("  research Who are the leading thinkers on AI alignment")
     print("  follow mcp-servers")
@@ -509,6 +651,11 @@ async def interactive_session() -> None:
                 print("Usage: follow <topic>")
                 continue
             await follow_up(arg)
+        elif cmd == "parallel":
+            if not arg:
+                print("Usage: parallel <topic>")
+                continue
+            await research_parallel(arg)
         elif cmd == "synthesize":
             await synthesize()
         else:
@@ -525,6 +672,9 @@ def main() -> None:
         if sys.argv[1] == "follow" and len(sys.argv) > 2:
             topic = " ".join(sys.argv[2:])
             anyio.run(follow_up, topic)
+        elif sys.argv[1] == "parallel" and len(sys.argv) > 2:
+            topic = " ".join(sys.argv[2:])
+            anyio.run(research_parallel, topic)
         elif sys.argv[1] == "synthesize":
             anyio.run(synthesize)
         else:

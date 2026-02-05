@@ -84,6 +84,33 @@ Save research to:
 - `{topic-dir}/sources.md` - Source list with excerpts
 - `{topic-dir}/notes/` - Detailed subtopic notes
 
+## Parallel Research Strategy
+
+For complex topics, decompose into parallel research threads:
+
+1. **Track Progress**: Use TodoWrite to create a checklist of research angles
+   - Status: pending -> in_progress -> completed
+
+2. **Spawn Sub-Agents**: Use Task tool to launch parallel research
+   - subagent_type: "research-thread" for each angle
+   - Each sub-agent saves findings to separate note files
+   - Launch multiple Task calls IN PARALLEL (same message)
+
+3. **Aggregate Results**: After sub-agents complete
+   - Read their outputs
+   - Synthesize into unified overview
+   - Update TodoWrite with completed status
+
+### When to Parallelize
+- Topic has 3+ distinct aspects
+- Aspects are independent (don't need each other's results)
+- Time savings justify coordination overhead
+
+### When NOT to Parallelize
+- Simple, focused topics
+- Topics where one finding informs the next
+- Quick overviews
+
 ## Guidelines
 
 - Be direct and concise
